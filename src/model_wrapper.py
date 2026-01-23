@@ -27,63 +27,28 @@ from dwave.plugins.torch.models import (
 from einops import rearrange
 from plotly import graph_objects as go
 from torch.utils.data import DataLoader
-from torchvision.datasets import MNIST
-from torchvision.transforms import Compose, Resize, ToTensor
+from torchvision import datasets, transforms
 from torchvision.utils import make_grid
 
-from demo_configs import LOWER_THRESHOLD, UPPER_THRESHOLD
-
-from .decoder import Decoder
-from .encoder import Encoder
-from .losses import RadialBasisFunction, mmd_loss, nll_loss
-from .utils.common import get_latent_to_discrete, get_sampler_and_sampler_kwargs
-from .utils.persistent_qpu_sampler import PersistentQPUSampleHelper
+from .decoder import CNNDecoder as Decoder
+from .encoder import CNNEncoder
+from .encoder import EncoderWithNHF as Encoder
+from .utils.common import get_coeff, get_exp_coeff, get_sampler_and_sampler_kwargs
 
 
-def train_dvae(opt_step: int, epoch: int) -> bool:
-    """Schedule for training the DVAE.
-
-    Args:
-        opt_step: The current optimization step.
-        epoch: The current epoch.
-    """
-    ###TODO: Remove? this is not useful in its current state
-    return True
-
-
-def train_grbm(opt_step: int, epoch: int) -> bool:
-    """Schedule for training the GRBM.
-
-    Args:
-        opt_step: The current optimization step.
-        epoch: The current epoch.
-    """
-
-    return epoch < 6 and opt_step % 10 == 0
-
-
-def get_dataset(image_size: int, batch_size: int, dataset_size: Optional[int] = None) -> DataLoader:
-    transform = Compose(
-        [
-            Resize((image_size, image_size)),
-            ToTensor(),
-            lambda x: torch.round(x),  # Round values to 0 or 1
-        ]
+def get_dataset(batch_size: int, dataset_size: Optional[int] = None) -> DataLoader:
+    transform = transforms.Compose(
+        [transforms.ToTensor(), transforms.Lambda(lambda x: (x > 0.5).float())]
     )
 
-    # Load the dataset and create the dataloader
-    dataset = MNIST(
-        root="data",
-        train=True,
-        download=True,
-        transform=transform,
-    )
+    # For training data with augmentation
+    mnist_dataset = datasets.MNIST(root="./data", train=True, download=True, transform=transform)
     if dataset_size:
-        dataset = torch.utils.data.random_split(
-            dataset, [dataset_size, len(dataset) - dataset_size]
+        mnist_dataset = torch.utils.data.random_split(
+            mnist_dataset, [dataset_size, len(mnist_dataset) - dataset_size]
         )[0]
-
-    return DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+    dataloader = DataLoader(mnist_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+    return dataloader
 
 
 def display_dataset(dataset: DataLoader, num_rows: int) -> go.Figure:
@@ -103,6 +68,28 @@ def display_dataset(dataset: DataLoader, num_rows: int) -> go.Figure:
     return fig
 
 
+class LatentToDiscrete:
+    def __init__(self):
+        self.flip_probability = 0.0  # This is changed during training
+        self.noise_level = 0.0  # This is changed during training
+
+    def __call__(self, latents: torch.Tensor, n_samples: int = 1) -> torch.Tensor:
+        assert n_samples == 1, "Only n_samples=1 is supported in this LatentToDiscrete"
+        # print("In latent_to_discrete:")
+        # print("Latents shape:", latents.shape)
+        discretes = torch.sign(latents)
+        # Return the straight-through discrete variables
+        spins = (latents + (discretes - latents).detach()).unsqueeze(1)
+        # Randomly flip some of the spins with probability self.flip_probability
+        if self.flip_probability > 0.0:
+            flip_mask = torch.rand_like(spins) < self.flip_probability
+            spins = torch.where(flip_mask, -spins, spins)
+        if self.noise_level > 0.0:
+            noise = torch.randn_like(spins) * self.noise_level
+            spins += noise
+        return spins
+
+
 class TrainingError(Exception):
     """Error when training the model."""
 
@@ -115,10 +102,16 @@ class ModelWrapper:
     """
 
     def __init__(
-        self, qpu: str, n_latents: Optional[int] = None, training_parameter_file: str = None
+        self,
+        qpu: str,
+        n_latents_per_pixel: int,
+        training_parameter_file: str = None,
     ) -> None:
         self.qpu: str = qpu
-        self.n_latents: int = n_latents
+        self.n_latents_per_pixel: int = n_latents_per_pixel
+        self._shapex: tuple[int, int, int] = (1, 28, 28)
+        self._shapez: tuple[int, int, int] = (self.n_latents_per_pixel, 3, 3)
+        self._factors: list[int] = [4, 4, 4]
 
         self._dvae = None
         self._grbm = None
@@ -171,49 +164,63 @@ class ModelWrapper:
         self._load_dataset(batch_size=self.BATCH_SIZE, dataset_size=self.DATASET_SIZE)
 
         # currently assuming config and and model have same base name
-        self._dvae.load_state_dict(torch.load(file_path / "dvae.pth"))
-        self._grbm.load_state_dict(torch.load(file_path / "grbm.pth"))
+        dvae = torch.load(file_path / "dvae.pth", weights_only=False, map_location=self._device)
+        self._dvae.load_state_dict(dvae.state_dict())
+        self._grbm = torch.load(
+            file_path / "grbm.pth", weights_only=False, map_location=self._device
+        )
 
     def setup(self) -> None:
         """Initial setup for the VAE and GRBM."""
         self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        if self.LATENT_TO_DISCRETE in ["heaviside"] and self.N_REPLICAS != 1:
-            raise ValueError("heaviside latent-to-discrete can only be used with n_replicas=1")
-
         dvae = DiscreteVariationalAutoencoder(
-            encoder=Encoder(n_latents=self.n_latents),
-            decoder=Decoder(n_latents=self.n_latents),
-            latent_to_discrete=get_latent_to_discrete(self.LATENT_TO_DISCRETE),
+            encoder=Encoder(
+                main_encoder=CNNEncoder(shapex=self._shapex, factors=self._factors),
+                n_latents_per_pixel=self.n_latents_per_pixel,
+                use_orthogonal_layers=False,
+                num_orthogonal_layers=1,
+                use_bias_in_orthogonal_layers=True,
+                flatten_all_features=False,
+                disable_hashmap=True,
+            ),
+            decoder=Decoder(
+                shapez=self._shapez,
+                factors=self._factors + [4],
+                shapex=self._shapex,
+                codebook_dim=64 * 4,
+            ),
+            latent_to_discrete=LatentToDiscrete(),
         )
 
         self._dvae = dvae.to(self._device)
-
-        self.sampler, self.sampler_kwargs, graph, self.linear_range, self.quadratic_range = (
+        self.sampler, graph, self.linear_range, self.quadratic_range, self.sampler_kwargs = (
             get_sampler_and_sampler_kwargs(
                 num_reads=self.NUM_READS,
                 annealing_time=self.ANNEALING_TIME,
-                n_latents=self.n_latents,
+                num_sweeps=self.NUM_SWEEPS,
+                n_latents=self.n_latents_per_pixel * self._shapez[1] * self._shapez[2],
                 random_seed=self.RANDOM_SEED,
-                qpu=self.qpu,
+                use_qpu=True,
+                solver_name=self.qpu,
+                parallel_embedding=False,
             )
         )
 
         grbm = GraphRestrictedBoltzmannMachine(
-            graph.nodes,
-            graph.edges,
+            graph.nodes(),
+            graph.edges(),
         )
         self._grbm = grbm.to(self._device)
+        self._grbm_sampleset = None
 
         self._dvae_optimizer = torch.optim.Adam(
             self._dvae.parameters(),
             lr=self.AUTOENCODER_INITIAL_LR,
-            weight_decay=self.AUTOENCODER_WEIGHT_DECAY,
         )
         self._grbm_optimizer = torch.optim.Adam(
             self._grbm.parameters(),
             lr=self.BM_INITIAL_LR,
-            weight_decay=self.BM_WEIGHT_DECAY,
         )
 
     def _load_dataset(self, batch_size: int, dataset_size: Optional[int] = None) -> None:
@@ -224,31 +231,17 @@ class ModelWrapper:
             dataset_size: The number of images to use for training.
                 Default (``None``) uses all available images.
         """
-        self._dataloader = get_dataset(self.IMAGE_SIZE, batch_size, dataset_size)
+        self._dataloader = get_dataset(batch_size, dataset_size)
 
     def train_init(
         self,
-        n_epochs: int,
     ) -> None:
-        """Initialize the model for training.
-
-        Args:
-            n_epochs: Number of epochs to train. Used to determine the learning rate schedules.
-        """
+        """Initialize the model for training."""
         self.losses["mse_losses"].clear()
         self.losses["dvae_losses"].clear()
 
         # set the random seed for reproducibility
         torch.manual_seed(self.RANDOM_SEED)
-
-        # initialize and store training parameters in a
-        # temporary dict to be accessed by the step method
-        self._tpar = {}
-
-        self._tpar["persistent_qpu_sample_helper"] = PersistentQPUSampleHelper(
-            max_deque_size=self.MAX_DEQUE_SIZE,
-            iterations_before_resampling=self.ITERATIONS_BEFORE_RESAMPLING,
-        )
 
         if self._dvae is None or self._grbm is None:
             self.setup()
@@ -256,32 +249,12 @@ class ModelWrapper:
         if self._dataloader is None:
             self._load_dataset(batch_size=self.BATCH_SIZE, dataset_size=self.DATASET_SIZE)
 
-        n_batches = len(self._dataloader)
-
-        total_opt_steps = n_epochs * n_batches
-
-        self._tpar["dvae_lr_schedule"] = np.geomspace(
-            self.AUTOENCODER_INITIAL_LR, self.AUTOENCODER_FINAL_LR, total_opt_steps + 1
-        )
-        self._tpar["grbm_lr_schedule"] = np.geomspace(
-            self.BM_INITIAL_LR, self.BM_FINAL_LR, total_opt_steps + 1
-        )
-
-        self._tpar["opt_step"] = 0
-
-        # use for self.LOSS_FUNCTION == "mmd":
-        self._tpar["kernel"] = RadialBasisFunction(num_features=7).to(self._device)
-
-        self._tpar["sample_set"] = None
-
-        self._tpar["init_done"] = True
-
-    def step(self, batch: tuple[torch.Tensor, torch.Tensor], epoch: int) -> torch.Tensor:
+    def step(self, batch: tuple[torch.Tensor, torch.Tensor], opt_step: int) -> torch.Tensor:
         """Train the model on a single batch.
 
         Args:
             batch: The batch to train on.
-            epoch: The current epoch (used to determine training based on schedule).
+            opt_step: The current optimization step.
 
         Returns:
             torch.Tensor: MSE loss from training step.
@@ -293,61 +266,75 @@ class ModelWrapper:
         images = images.to(self._device)
         self._dvae.train()
         self._grbm.train()
+        grbm_coeff = get_exp_coeff(
+            opt_step, n_rampup=10_000, min_coeff=1e-6, max_coeff=0.1, delay=1_000, cutoff=20_000
+        )
+        cov_matching_coeff = get_coeff(opt_step, n_rampup=5_000, min_coeff=1e-2, max_coeff=10)
+        bimodal_coeff = get_coeff(opt_step, n_rampup=8_000, min_coeff=1e-3, max_coeff=0.1)
+        l1_coeff = get_coeff(opt_step, n_rampup=10_000, min_coeff=1e-6, max_coeff=1.0)
+        flip_prob = get_coeff(opt_step, n_rampup=1_000, min_coeff=0.0, max_coeff=0.1)
+        noise_level = get_coeff(opt_step, n_rampup=1_000, min_coeff=1e-4, max_coeff=0.2)
+        self._dvae.latent_to_discrete.flip_probability = flip_prob
+        self._dvae.latent_to_discrete.noise_level = noise_level
 
-        _, spins, reconstructed_images = self._dvae(images, self.N_REPLICAS)
+        latents, spins, reconstructed_images = self._dvae(images, n_samples=1)
+        reconstructed_images = reconstructed_images.squeeze(1)
+        spins = spins.squeeze(1)
+        if flip_prob > 0.0 or noise_level > 0.0:
+            # The flipped or noised spins go into the decoder to avoid overfitting, but the
+            # original clean spins should be used for all other computations:
+            spins = torch.sign(latents)
+            spins = latents + (spins - latents).detach()
 
-        # train autoencoder
-        if train_dvae(self._tpar["opt_step"], epoch):
-            self._dvae_optimizer.zero_grad()
-            mse_loss = torch.nn.functional.mse_loss(
-                reconstructed_images,
-                images.unsqueeze(1).repeat(1, self.N_REPLICAS, 1, 1, 1),
-            )
-            self.losses["mse_losses"].append(mse_loss.item())
+        self._dvae_optimizer.zero_grad()
 
-            _mmd_loss = mmd_loss(
-                spins=spins,
-                kernel=self._tpar["kernel"],
-                grbm=self._grbm,
-                sampler=self.sampler,
-                sampler_kwargs=self.sampler_kwargs,
+        l1_loss = torch.nn.functional.l1_loss(reconstructed_images, images)
+        l2_loss = torch.nn.functional.mse_loss(reconstructed_images, images)
+        bimodal_loss = torch.nn.functional.mse_loss(latents, spins)
+
+        if (
+            grbm_coeff > 0.0
+            or self._grbm_sampleset is None
+            or (grbm_coeff == 0.0 and opt_step % 10 == 0)
+        ):
+            self._grbm_sampleset = self._grbm.sample(
+                self.sampler,
+                as_tensor=False,
+                prefactor=0.16,
+                sample_params=self.sampler_kwargs,
+                device=self._device,
                 linear_range=self.linear_range,
                 quadratic_range=self.quadratic_range,
-                prefactor=self.PREFACTOR,
             )
+        grbm_samples = self._grbm.sampleset_to_tensor(self._grbm_sampleset, device=self._device)
+        cov_latents = torch.cov(latents.flatten(start_dim=1).T)
+        cov_grbm = torch.cov(grbm_samples.detach().T)
+        cov_matching_loss = torch.nn.functional.mse_loss(cov_latents, cov_grbm)
 
-            dvae_loss = mse_loss + _mmd_loss
+        mean_latents = torch.mean(latents.flatten(start_dim=1), dim=0)
+        mean_grbm = torch.mean(grbm_samples.detach(), dim=0)
+        cov_matching_loss += torch.nn.functional.mse_loss(mean_latents, mean_grbm)
 
-            self.losses["dvae_losses"].append(dvae_loss.item())
+        loss = (
+            l2_loss
+            + l1_coeff * l1_loss
+            + bimodal_coeff * bimodal_loss
+            + cov_matching_coeff * cov_matching_loss
+        )
+        loss.backward()
+        self._dvae_optimizer.step()
 
-            dvae_loss.backward()
-            self._dvae_optimizer.step()
-
-        # train boltzmann machine
-        if train_grbm(self._tpar["opt_step"], epoch):
+        if grbm_coeff > 0.0:
             self._grbm_optimizer.zero_grad()
-            grbm_loss, self._tpar["sample_set"] = nll_loss(
-                spins=spins.detach(),
-                grbm=self._grbm,
-                sampler=self.sampler,
-                sampler_kwargs=self.sampler_kwargs,
-                linear_range=self.linear_range,
-                quadratic_range=self.quadratic_range,
-                prefactor=self.PREFACTOR,
-                persistent_qpu_sample_helper=self._tpar["persistent_qpu_sample_helper"],
-                sample_set=self._tpar["sample_set"],
+            grbm_loss = self._grbm.quasi_objective(
+                s_observed=spins.detach().flatten(start_dim=1), s_model=grbm_samples
             )
-            grbm_loss.backward()
+            scaled_grbm_loss = grbm_coeff * grbm_loss
+            scaled_grbm_loss.backward()
             self._grbm_optimizer.step()
-
-        # update learning rate
-        for param_group in self._dvae_optimizer.param_groups:
-            param_group["lr"] = self._tpar["dvae_lr_schedule"][self._tpar["opt_step"]]
-        for param_group in self._grbm_optimizer.param_groups:
-            param_group["lr"] = self._tpar["grbm_lr_schedule"][self._tpar["opt_step"]]
-        self._tpar["opt_step"] += 1
-
-        return mse_loss
+        self.losses["mse_losses"].append(l2_loss.item())
+        self.losses["dvae_losses"].append(loss.item())
+        return loss
 
     def generate_output(self, sharpen: bool = False, save_to_file: str = "") -> go.Figure:
         """Generate output images from trained model.
@@ -359,26 +346,34 @@ class ModelWrapper:
             go.Figure: Plotly figure.
         """
         images_per_row = 16
+        print("Generating output images...")
         self._dvae.eval()
         self._grbm.eval()
+        print("DVAE and GRB in eval mode")
 
         with torch.no_grad():
-            samples = self._grbm.sample(
+            grbm_samples = self._grbm.sample(
                 self.sampler,
-                prefactor=self.PREFACTOR,
+                as_tensor=True,
+                prefactor=0.16,
                 device=self._device,
                 linear_range=self.linear_range,
                 quadratic_range=self.quadratic_range,
                 sample_params=self.sampler_kwargs,
             )
-
-        images = self._dvae.decoder(samples.unsqueeze(1)).squeeze(1).clip(0.0, 1.0).detach().cpu()
+            print("Got samples from GRBM")
+            latents_from_grbm = grbm_samples.view(
+                grbm_samples.size(0), 1, self.n_latents_per_pixel, self._shapez[1], self._shapez[2]
+            )
+            print("Reshaped latents from GRBM with shape", latents_from_grbm.shape)
+            print(self._dvae.decoder)
+            images = self._dvae.decoder(latents_from_grbm).squeeze(1).clip(0.0, 1.0).detach().cpu()
+            print("Decoded images from latents")
         if sharpen:
-            over = (images - UPPER_THRESHOLD).heaviside(torch.tensor([0.0]))
-            under = (images - LOWER_THRESHOLD).heaviside(torch.tensor([0.0]))
-            images = (over + abs(over - 1) * images) * under
+            images = (images > 0.5).float()
 
         generation_tensor_for_plot = make_grid(images, nrow=images_per_row)
+        print("Got grid for plotting")
 
         fig = px.imshow(generation_tensor_for_plot.permute(1, 2, 0))
 
@@ -454,10 +449,9 @@ class ModelWrapper:
         # show the reconstruction of the input samples.
         batch = next(iter(self._dataloader))[0]
         self._dvae.eval()
-        self._grbm.eval()
 
         _, _, reconstructed_batch = self._dvae(batch.to(self._device))
-        reconstructed_batch[:, :, :, :, -1] = 1.0
+        # reconstructed_batch[:, :, :, :, -1] = 1.0 # what is this?
         images = make_grid(
             rearrange(
                 [batch.cpu(), reconstructed_batch.clip(0.0, 1.0).squeeze(1).cpu()],
@@ -468,9 +462,7 @@ class ModelWrapper:
         )
 
         if sharpen:
-            over = (images - UPPER_THRESHOLD).heaviside(torch.tensor([0.0]))
-            under = (images - LOWER_THRESHOLD).heaviside(torch.tensor([0.0]))
-            images = (over + abs(over - 1) * images) * under
+            images = (images > 0.5).float()
 
         fig = px.imshow(images.permute(1, 2, 0))
 

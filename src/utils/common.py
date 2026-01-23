@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import random
-from typing import Callable, Literal, Optional
+import time
+from typing import Optional
 
 import networkx as nx
-import torch
-from dwave.system import DWaveSampler, FixedEmbeddingComposite
+import numpy as np
+from dimod import Sampler
+from dwave.system import DWaveSampler, FixedEmbeddingComposite, ParallelEmbeddingComposite
 
 
 def greedy_get_subgraph(
@@ -88,75 +90,127 @@ def greedy_get_subgraph(
     return nx.relabel_nodes(subgraph, mapping), mapping
 
 
+class InsistentSampler:
+    def __init__(
+        self,
+        sampler: Sampler,
+        max_attempts: int = 10,
+        progressive_sleep: bool = True,
+        initial_sleep: float = 1.0,
+    ):
+        self.sampler = sampler
+        self.max_attempts = max_attempts
+        self.progressive_sleep = progressive_sleep
+        self.initial_sleep = initial_sleep
+
+    def sample(self, *args, **kwargs):
+        import traceback
+
+        attempt = 0
+        sleep_time = self.initial_sleep
+        while attempt < self.max_attempts:
+            try:
+                return self.sampler.sample(*args, **kwargs)
+            except Exception as e:
+                print(f"Sampler attempt {attempt + 1} failed with exception: {e}")
+                traceback.print_exc()
+                attempt += 1
+                if self.progressive_sleep:
+                    time.sleep(sleep_time)
+                    sleep_time *= 2  # Exponential backoff
+                else:
+                    time.sleep(self.initial_sleep)
+
+    def sample_ising(self, *args, **kwargs):
+        return self.sampler.sample_ising(*args, **kwargs)
+
+
 def get_sampler_and_sampler_kwargs(
-    num_reads: int, annealing_time: float, n_latents: int, random_seed: int, qpu: str
-) -> tuple[FixedEmbeddingComposite, dict, nx.Graph, tuple[float, float], tuple[float, float]]:
-    """TODO
-
-    Args:
-        num_reads: TODO
-        annealing_time: TODO
-        n_latents: TODO
-        random_seed: TODO
-        qpu: TODO
-
-    Returns:
-        sampler: TODO
-        sampler_kwargs: TODO
-        graph: TODO
-        linear_range: TODO
-        quadratic_range: TODO
-    """
-
-    qpu = DWaveSampler(solver=qpu)
-    graph = qpu.to_networkx_graph()
-    graph, mapping = greedy_get_subgraph(n_nodes=n_latents, random_seed=random_seed, graph=graph)
-
-    sampler = FixedEmbeddingComposite(qpu, {l_: [p] for p, l_ in mapping.items()})
-    linear_range, quadratic_range = qpu.properties["h_range"], qpu.properties["j_range"]
-    sampler_kwargs = dict(
-        num_reads=num_reads,
-        # Set `answer_mode` to "raw" so no samples are aggregated
-        answer_mode="raw",
-        # Set `auto_scale`` to `False` so the sampler sample from the intended distribution
-        auto_scale=False,
-        annealing_time=annealing_time,
-        label="Examples - ML MNIST Image Gen",
+    num_reads: int,
+    annealing_time: int | float,
+    num_sweeps: int,
+    n_latents: int,
+    random_seed: int | None,
+    use_qpu: bool,
+    parallel_embedding: bool = True,
+    solver_name: str = "Advantage2_prototype2.6",
+) -> tuple[InsistentSampler, nx.Graph, list | None, list | None, dict]:
+    qpu = DWaveSampler(solver=solver_name)
+    h_range, j_range = qpu.properties["h_range"], qpu.properties["j_range"]
+    qpu_graph = qpu.to_networkx_graph()
+    graph, mapping = greedy_get_subgraph(
+        n_nodes=n_latents, random_seed=random_seed, graph=qpu_graph
     )
+    if use_qpu:
+        if parallel_embedding:
+            from math import ceil
 
-    return sampler, sampler_kwargs, graph, linear_range, quadratic_range
+            from minorminer.utils.parallel_embeddings import find_multiple_embeddings
 
-
-def get_latent_to_discrete(
-    mode: Optional[Literal["heaviside"]],
-) -> Optional[Callable[[torch.Tensor, int], torch.Tensor]]:
-    """TODO
-
-    Args:
-        mode: TODO
-
-    Returns:
-        latent_to_discrete: TODO
-    """
-    if mode is None:
-        return None
-
-    if mode != "heaviside":
-        raise ValueError("Invalid Mode: Mode is not heaviside.")
-
-    def latent_to_discrete(logits: torch.Tensor, n_samples: int) -> torch.Tensor:
-        # logits is of shape (batch_size, n_discrete)
-        # we ignore n_samples as we won't be doing any stochastic processes
-        with torch.no_grad():
-            hard = (
-                torch.heaviside(
-                    logits,
-                    values=torch.tensor(0, device=logits.device, dtype=logits.dtype),
-                )
-                * 2
-                - 1
+            embeddings = find_multiple_embeddings(
+                graph,
+                qpu_graph,
+                max_num_emb=qpu_graph.number_of_nodes() // graph.number_of_nodes(),
+                one_to_iterable=False,
+                timeout=60 * 5,  # 5 minutes
             )
+            print(f"Found {len(embeddings)} embeddings for the graph.")
+            taken_nodes = {}
+            for i, emb in enumerate(embeddings):
+                for v in emb.values():
+                    if v in taken_nodes:
+                        raise ValueError(
+                            f"QPU node {v} is already taken by embedding {taken_nodes[v]}:\n"
+                            f"{embeddings[taken_nodes[v]]}\nCurrent embedding:\n{emb}"
+                        )
+                    taken_nodes[v] = i
+            sampler = ParallelEmbeddingComposite(
+                qpu, embeddings=[{l_: [p] for l_, p in emb.items()} for emb in embeddings]
+            )
+            n_embeddings = len(embeddings)
+            num_reads = ceil(num_reads / n_embeddings)
+        else:
+            sampler = FixedEmbeddingComposite(qpu, {l_: [p] for p, l_ in mapping.items()})
+        sampler_kwargs = dict(
+            num_reads=num_reads,
+            # Set `answer_mode` to "raw" so no samples are aggregated
+            answer_mode="raw",
+            # Set `auto_scale`` to `False` so the sampler sample from the intended
+            # distribution
+            auto_scale=False,
+            annealing_time=annealing_time,
+        )
+    else:
+        from dwave.samplers import SimulatedAnnealingSampler
 
-        return (hard - logits.detach() + logits).unsqueeze(1)
+        sampler = SimulatedAnnealingSampler()
+        sampler_kwargs = dict(
+            num_reads=num_reads,
+            beta_range=[1, 1],
+            proposal_acceptance_criterion="Gibbs",
+            randomize_order=True,
+            num_sweeps=num_sweeps,
+        )
+    return InsistentSampler(sampler), graph, h_range, j_range, sampler_kwargs
 
-    return latent_to_discrete
+
+def get_coeff(step, n_rampup, min_coeff, max_coeff, delay=0, cutoff=np.inf):
+    if step < delay:
+        return 0.0
+    elif step < n_rampup + delay:
+        return min_coeff + (max_coeff - min_coeff) * ((step - delay) / n_rampup)
+    elif step > n_rampup + delay and step < cutoff:
+        return max_coeff
+    else:
+        return 0.0
+
+
+def get_exp_coeff(step, n_rampup, min_coeff, max_coeff, delay=0, cutoff=np.inf):
+    if step < delay:
+        return 0.0
+    elif step < n_rampup + delay:
+        return min_coeff * (max_coeff / min_coeff) ** ((step - delay) / n_rampup)
+    elif step > n_rampup + delay and step < cutoff:
+        return max_coeff
+    else:
+        return 0.0

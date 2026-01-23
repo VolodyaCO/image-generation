@@ -170,7 +170,7 @@ def generate_model_data(model_data: dict) -> html.Div:
             html.Div(
                 [
                     html.P([html.B("QPU: "), model_data["qpu"]]),
-                    html.P([html.B("Epochs: "), model_data["n_epochs"]]),
+                    html.P([html.B("Opt steps: "), model_data["opt_steps"]]),
                 ]
             ),
             html.Div(

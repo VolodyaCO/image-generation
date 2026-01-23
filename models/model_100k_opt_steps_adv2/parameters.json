@@ -1,0 +1,1 @@
+{"n_latents": 288, "opt_steps": 100000, "prefactor": 0.16, "qpu": "Advantage2_system1.10", "num_read": 256, "image_size": 28, "batch_size": 512, "dateset_size": null}

@@ -29,7 +29,12 @@ from dash.exceptions import PreventUpdate
 from plotly import graph_objects as go
 
 from demo_configs import SHARPEN_OUTPUT
-from demo_interface import SOLVERS, generate_model_data, generate_options, generate_problem_details_table
+from demo_interface import (
+    SOLVERS,
+    generate_model_data,
+    generate_options,
+    generate_problem_details_table,
+)
 from src.model_wrapper import ModelWrapper
 from src.utils.callback_helpers import (
     IMAGE_GEN_FILE_PREFIX,
@@ -445,7 +450,7 @@ def train(
             last-trained-model: The directory name of the model trained by this run.
             progress-wrapper-className: The classname of the progress wrapper.
     """
-    model = ModelWrapper(qpu=qpu, n_latents=n_latents)
+    model = ModelWrapper(qpu=qpu, n_latents_per_pixel=n_latents // 9)
 
     model.train_init(n_epochs)
     fig_output, fig_reconstructed, fig_mse_loss, fig_dvae_loss = execute_training(
@@ -562,8 +567,10 @@ def generate(
     if model_data["qpu"] and not (len(SOLVERS) and model_data["qpu"] in SOLVERS):
         return GenerateReturn(popup_classname="")
 
-    model = ModelWrapper(qpu=model_data["qpu"], n_latents=model_data["n_latents"])
+    model = ModelWrapper(qpu=model_data["qpu"], n_latents_per_pixel=model_data["n_latents"] // 9)
     model.load(file_path=MODEL_PATH / model_file_name)
+
+    print(model)
 
     if tune_parameters:
         model.train_init(n_epochs)
@@ -583,6 +590,7 @@ def generate(
         )
 
     else:
+        print("Not tuning params")
         fig_output = model.generate_output(sharpen=SHARPEN_OUTPUT)
         fig_reconstructed = model.generate_reconstucted_samples(sharpen=SHARPEN_OUTPUT)
 

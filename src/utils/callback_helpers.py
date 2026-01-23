@@ -57,10 +57,8 @@ def create_model_files(
             {
                 "n_latents": n_latents,
                 "n_epochs": n_epochs,
-                "prefactor": model.PREFACTOR,
                 "qpu": qpu,
                 "num_read": model.NUM_READS,
-                "loss_function": model.LOSS_FUNCTION,
                 "image_size": model.IMAGE_SIZE,
                 "batch_size": model.BATCH_SIZE,
                 "dateset_size": model.DATASET_SIZE,
@@ -95,6 +93,7 @@ def execute_training(
         fig_mse_loss: The graph showing the MSE Loss.
         fig_total_loss: The graph showing the total Loss (MMD + MSE).
     """
+    opt_step = len(loss_data["mse_losses"]) if loss_data is not None else 0
     for epoch in range(n_epochs):
         start_time = time.perf_counter()
         print(f"Starting epoch {epoch + 1}/{n_epochs}")
@@ -102,14 +101,10 @@ def execute_training(
         total = len(model._dataloader)
         for i, batch in enumerate(model._dataloader):
             set_progress((str(total * epoch + i), str(total * n_epochs)))
-            mse_loss = model.step(batch, epoch)
-
-        learning_rate_dvae = model._tpar["dvae_lr_schedule"][model._tpar["opt_step"]]
-        learning_rate_grbm = model._tpar["grbm_lr_schedule"][model._tpar["opt_step"]]
+            mse_loss = model.step(batch, opt_step)
+            opt_step += 1
         print(
             f"Epoch {epoch + 1}/{n_epochs} - MSE Loss: {mse_loss.item():.4f} - "
-            f"Learning rate DVAE: {learning_rate_dvae:.3E} "
-            f"Learning rate GRBM: {learning_rate_grbm:.3E} "
             f"Time: {(time.perf_counter() - start_time)/60:.2f} mins. "
         )
         with open(PROBLEM_DETAILS_PATH, "w") as f:
@@ -119,8 +114,6 @@ def execute_training(
                     "Epoch": f"{epoch + 1}/{n_epochs}",
                     "Batch Size": model.BATCH_SIZE,
                     "Latents": n_latents,
-                    "Learning rate DVAE": f"{learning_rate_dvae:.3E}",
-                    "Learning rate GRBM": f"{learning_rate_grbm:.3E}",
                     "Mean Squared Error Loss": f"{mse_loss.item():.4f}",
                 },
                 f,

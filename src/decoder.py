@@ -13,50 +13,73 @@
 # limitations under the License.
 
 import torch
+import torch.nn as nn
+from einops import einsum, rearrange
 
 
-class Decoder(torch.nn.Module):
-    """A decoder network that maps latent variables to images."""
-
-    def __init__(self, n_latents: int):
+class CNNDecoder(nn.Module):
+    def __init__(
+        self,
+        shapez: tuple[int, int, int],
+        factors: list[int],
+        shapex: tuple[int, int, int],
+        codebook_dim: int,
+        n_layers_per_block: int = 3,
+    ):
         super().__init__()
-        channels = [n_latents, 128, 64, 32, 1]
-        layers = []
-
-        # The input will be of shape (batch_size, n_latents), we need to project it
-        # to the shape (batch_size, n_latents, 2, 2)
-        self.increase_latent_dim = torch.nn.Linear(n_latents, n_latents * 2 * 2)
-        self.make_2x2_images = torch.nn.Unflatten(-1, (n_latents, 2, 2))
-        self.merge_batch_dim_and_replica_dim = torch.nn.Flatten(start_dim=0, end_dim=1)
-
-        for i in range(len(channels) - 1):
-            # A transposed convolutional layer does not modify the image size
-            layers.append(
-                torch.nn.ConvTranspose2d(
-                    channels[i], channels[i + 1], kernel_size=3, stride=1, padding=1
-                )
-            )
-
-            # Batch normalisation is used to stabilise the learning process
-            layers.append(torch.nn.BatchNorm2d(channels[i + 1]))
-            layers.append(torch.nn.Dropout2d(0.2))
-            # We upsample the image size by 2
-            layers.append(torch.nn.Upsample(scale_factor=2))
-            # Finally, we apply a non-linearity
-            layers.append(torch.nn.LeakyReLU())
-
-        # We append a last convolutional transpose layer to obtain the final image
-        layers.append(
-            torch.nn.ConvTranspose2d(channels[-1], channels[-1], kernel_size=3, stride=1, padding=1)
+        self.shapez = shapez
+        self.factors = factors
+        self.shapex = shapex
+        cz, hz, wz = shapez
+        cx, hx, wx = shapex
+        # Create a parameter with he normal initialization for the codebook:
+        self.codebook = nn.Parameter(
+            torch.randn(cz, codebook_dim, dtype=torch.float32) * (2 / codebook_dim) ** 0.5
         )
-        self.convtrans = torch.nn.Sequential(*layers)
+        cout = codebook_dim
+        layers = []
+        hi, wi = hz, wz
+        for nl, factor in enumerate(factors):
+            cin = cout
+            cout = int(cout / factor)
+            layers.append(nn.LayerNorm([cin, hi, wi]))
+            hi = hi * 2
+            wi = wi * 2
+            # Expand the image dimension with same number of channels:
+            layers.append(nn.ConvTranspose2d(cin, cin, kernel_size=4, stride=2, padding=1))
+            # layers.append(nn.UpsamplingBilinear2d(scale_factor=2))
+            layers.append(nn.ReLU())
+            layers.append(nn.LayerNorm([cin, hi, wi]))
+            # Decrease number of channels, keep image dimension (with convolutional transpose
+            # layers):
+            layers.append(nn.ConvTranspose2d(cin, cout, kernel_size=3, stride=1, padding=1))
+            for _ in range(n_layers_per_block - 1):
+                layers.append(nn.ReLU())
+                layers.append(nn.LayerNorm([cout, hi, wi]))
+                layers.append(nn.ConvTranspose2d(cout, cout, kernel_size=3, stride=1, padding=1))
+
+        # Add a final layer with a bigger kernel size for better reconstruction
+        layers.append(nn.ReLU())
+        layers.append(nn.LayerNorm([cout, hi, wi]))
+        layers.append(nn.ConvTranspose2d(cout, cout, kernel_size=7, stride=1, padding=3))
+
+        # Add to the layers a resize to the final image shapex:
+        self.deconv = nn.Sequential(*layers)
+        self.final_resize = nn.UpsamplingNearest2d(size=(hx, wx))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.increase_latent_dim(x)
-        x = self.make_2x2_images(x)
-        batch_dim = x.shape[0]
-        replica_dim = x.shape[1]
-        x = self.merge_batch_dim_and_replica_dim(x)
-        x = self.convtrans(x)
-
-        return x.reshape(batch_dim, replica_dim, *x.shape[1:])
+        print("Decoder input shape:", x.shape)
+        # x is of shape (batch_size, n_samples, cz, hz, wz)
+        batch_size = x.shape[0]
+        x = rearrange(x, "b n cz hz wz -> (b n) cz hz wz")
+        print("Rearranged decoder input shape:", x.shape)
+        # Convert spin strings to bitstrings in {0, 1}:
+        x = (x + 1) / 2
+        # Now we perform a matrix multiplication with the codebook to get the
+        # continuous representation:
+        x = einsum(x, self.codebook, "b c h w, c d -> b d h w")
+        print("After codebook multiplication shape:", x.shape)
+        x = self.deconv(x)
+        x = self.final_resize(x)
+        x = rearrange(x, "(b n) c h w -> b n c h w", b=batch_size)
+        return x
